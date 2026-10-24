@@ -4,12 +4,13 @@ import TestRenderer, {
 	type ReactTestRenderer,
 	type ReactTestRendererJSON,
 } from "react-test-renderer";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { MobileCapSummary } from "@/api/mobile";
 import CapsScreen from "../../app/(tabs)";
 import UploadScreen from "../../app/(tabs)/upload";
 
 type AuthStub = {
-	status: "signedIn";
+	status: "signedIn" | "signedOut";
 	apiKey: string;
 	bootstrap: {
 		activeOrganizationId: string;
@@ -42,7 +43,7 @@ type AuthStub = {
 		}>;
 		getCap: (id: string) => Promise<{
 			cap: {
-				upload: null;
+				upload: MobileCapSummary["upload"];
 			};
 		}>;
 		getCapStatuses: (ids: readonly string[]) => Promise<{
@@ -177,9 +178,9 @@ const uploadQueueState = vi.hoisted(
 	}),
 );
 
-const uploadQueueActionsState = vi.hoisted((): { value: unknown[] } => ({
-	value: [],
-}));
+const uploadQueueActionsState = vi.hoisted(
+	(): { value: unknown[]; reduce: boolean } => ({ value: [], reduce: false }),
+);
 
 const recordingUploadState = vi.hoisted(() => ({
 	libraryRevision: 0,
@@ -592,9 +593,14 @@ vi.mock("@/uploads/uploadQueue", async (importOriginal) => {
 		...actual,
 		emptyUploadQueue: uploadQueueState.value,
 		uploadProgressPercent: (progress: number) => Math.round(progress * 100),
-		uploadQueueReducer: (state: { items: unknown[] }, action: unknown) => {
+		uploadQueueReducer: (
+			state: Parameters<typeof actual.uploadQueueReducer>[0],
+			action: Parameters<typeof actual.uploadQueueReducer>[1],
+		) => {
 			uploadQueueActionsState.value.push(action);
-			return state;
+			return uploadQueueActionsState.reduce
+				? actual.uploadQueueReducer(state, action)
+				: state;
 		},
 		uploadQueueStatusText: (item: {
 			processingMessage?: string | null;
@@ -1754,6 +1760,245 @@ describe("upload and dashboard visibility", () => {
 		}
 	});
 
+	describe("processing status polling", () => {
+		const processingDetail = {
+			cap: {
+				upload: {
+					phase: "processing" as const,
+					processingError: null,
+					processingMessage: "Converting video",
+					processingProgress: 42,
+					total: 100,
+					uploaded: 100,
+				},
+			},
+		};
+		const cancellations = [
+			"removal",
+			"unmount",
+			"sign-out",
+			"new session",
+		] as const;
+		let auth: AuthStub;
+		let renderer: ReactTestRenderer | undefined;
+
+		beforeEach(async () => {
+			vi.useFakeTimers();
+			uploadQueueActionsState.reduce = true;
+			auth = createAuth();
+			auth.refresh = vi.fn(() => Promise.resolve());
+			auth.client.getCap = vi.fn(() => Promise.resolve(processingDetail));
+			authState.value = auth;
+			const DocumentPicker = await import("expo-document-picker");
+			vi.mocked(DocumentPicker.getDocumentAsync).mockResolvedValueOnce({
+				assets: [
+					{
+						name: "slow.mp4",
+						uri: "file:///tmp/slow.mp4",
+						size: 100,
+						lastModified: 0,
+					},
+				],
+				canceled: false,
+			});
+			const { runMobileUpload } = await import("@/uploads/runMobileUpload");
+			vi.mocked(runMobileUpload).mockImplementationOnce(
+				async ({ onCreated }) => {
+					onCreated?.("video_123", "raw.mp4");
+					return { id: "video_123" } as Awaited<
+						ReturnType<typeof runMobileUpload>
+					>;
+				},
+			);
+		});
+
+		afterEach(async () => {
+			await act(async () => renderer?.unmount());
+			renderer = undefined;
+			uploadQueueActionsState.reduce = false;
+			vi.clearAllTimers();
+			vi.useRealTimers();
+		});
+
+		const startImport = async () => {
+			renderer = await renderComponent(React.createElement(UploadScreen));
+			const [browseButton] = renderer.root.findAllByProps({
+				accessibilityLabel: "Browse Files",
+			});
+			if (!browseButton)
+				throw new Error("Browse Files button was not rendered");
+			await act(async () => {
+				void browseButton.props.onPress();
+			});
+			return renderer;
+		};
+
+		const cancel = async (reason: (typeof cancellations)[number]) => {
+			if (!renderer) throw new Error("Upload screen was not rendered");
+			if (reason === "removal") {
+				const { ActionSheetIOS } = await import("react-native");
+				const sheet = vi.mocked(ActionSheetIOS.showActionSheetWithOptions);
+				sheet.mockClear();
+				const [menu] = renderer.root.findAllByProps({
+					accessibilityLabel: "More actions for slow.mp4",
+				});
+				if (!menu) throw new Error("Upload queue menu was not rendered");
+				await act(async () => {
+					menu.props.onPress({ stopPropagation: vi.fn() });
+				});
+				const call = sheet.mock.calls.at(-1);
+				if (!call) throw new Error("Upload queue sheet did not open");
+				await act(async () => {
+					call[1](call[0].options.indexOf("Remove from Queue"));
+				});
+				expect(
+					renderer.root.findAllByProps({
+						accessibilityLabel: "Upload slow.mp4",
+					}),
+				).toHaveLength(0);
+				return;
+			}
+			if (reason === "unmount") {
+				await act(async () => renderer?.unmount());
+				renderer = undefined;
+				return;
+			}
+			authState.value =
+				reason === "sign-out"
+					? { ...auth, status: "signedOut" }
+					: { ...createAuth(), apiKey: "new-api-key" };
+			await act(async () =>
+				renderer?.update(React.createElement(UploadScreen)),
+			);
+		};
+
+		it.each(["complete", "error"] as const)(
+			"observes a late %s after the initial four checks",
+			async (phase) => {
+				const startedAt = Date.now();
+				auth.client.getCap = vi.fn(async () => {
+					if (Date.now() - startedAt < 30_000) return processingDetail;
+					return {
+						cap: {
+							upload: {
+								...processingDetail.cap.upload,
+								phase,
+								processingError: phase === "error" ? "Conversion failed" : null,
+							},
+						},
+					};
+				});
+				const screen = await startImport();
+				await act(async () => {
+					await vi.advanceTimersByTimeAsync(17_500);
+				});
+				expect(auth.client.getCap).toHaveBeenCalledTimes(4);
+				expect(getTextNodes(screen.toJSON()).join(" ")).toContain(
+					"Converting video",
+				);
+				await act(async () => {
+					await vi.advanceTimersByTimeAsync(16_000);
+				});
+				expect(auth.client.getCap).toHaveBeenCalledTimes(6);
+				expect(getTextNodes(screen.toJSON()).join(" ")).toContain(
+					phase === "complete" ? "Ready to view" : "Conversion failed",
+				);
+				expect(auth.refresh).toHaveBeenCalledTimes(
+					phase === "complete" ? 2 : 1,
+				);
+				if (phase === "error") {
+					expect(
+						screen.root.findAllByProps({
+							accessibilityLabel: "Retry upload slow.mp4",
+						}).length,
+					).toBeGreaterThan(0);
+				}
+				await act(async () => {
+					await vi.advanceTimersByTimeAsync(32_000);
+				});
+				expect(auth.client.getCap).toHaveBeenCalledTimes(6);
+			},
+		);
+
+		it("keeps polling after a temporary status request failure", async () => {
+			auth.client.getCap = vi
+				.fn()
+				.mockRejectedValueOnce(new Error("Network unavailable"))
+				.mockResolvedValueOnce({ cap: { upload: null } });
+			const screen = await startImport();
+
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(1500);
+			});
+			expect(getTextNodes(screen.toJSON()).join(" ")).toContain(
+				"Unable to check processing. Retrying...",
+			);
+
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(3000);
+			});
+
+			expect(auth.client.getCap).toHaveBeenCalledTimes(2);
+			expect(getTextNodes(screen.toJSON()).join(" ")).toContain(
+				"Ready to view",
+			);
+		});
+
+		it.each(cancellations)(
+			"stops requests after %s while waiting",
+			async (reason) => {
+				await startImport();
+				await cancel(reason);
+				await act(async () => {
+					await vi.advanceTimersByTimeAsync(40_000);
+				});
+				expect(auth.client.getCap).not.toHaveBeenCalled();
+				expect(auth.refresh).toHaveBeenCalledTimes(1);
+			},
+		);
+
+		it.each(cancellations)(
+			"ignores an in-flight reply after %s",
+			async (reason) => {
+				const detail =
+					createDeferred<Awaited<ReturnType<AuthStub["client"]["getCap"]>>>();
+				auth.client.getCap = vi.fn(() => detail.promise);
+				await startImport();
+				await act(async () => {
+					await vi.advanceTimersByTimeAsync(1500);
+				});
+				expect(auth.client.getCap).toHaveBeenCalledTimes(1);
+				await cancel(reason);
+				await act(async () => {
+					detail.resolve({ cap: { upload: null } });
+				});
+				expect(uploadQueueActionsState.value).not.toContainEqual(
+					expect.objectContaining({ type: "complete" }),
+				);
+				expect(auth.refresh).toHaveBeenCalledTimes(1);
+				await act(async () => {
+					await vi.advanceTimersByTimeAsync(40_000);
+				});
+				expect(auth.client.getCap).toHaveBeenCalledTimes(1);
+			},
+		);
+
+		it("does not start an old upload's poll after a session change during refresh", async () => {
+			const refresh = createDeferred<void>();
+			auth.refresh = vi.fn(() => refresh.promise);
+			await startImport();
+			expect(auth.refresh).toHaveBeenCalledTimes(1);
+			await cancel("new session");
+			await act(async () => {
+				refresh.resolve();
+			});
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(40_000);
+			});
+			expect(auth.client.getCap).not.toHaveBeenCalled();
+		});
+	});
+
 	it("opens the native iOS upload queue sheet", async () => {
 		uploadQueueState.value.items = [
 			{
@@ -2117,6 +2362,95 @@ describe("upload and dashboard visibility", () => {
 
 		expect(auth.client.listCaps).toHaveBeenCalledTimes(2);
 	});
+
+	it.each(["success", "failure"] as const)(
+		"releases pagination when an overlapping background reload ends in %s",
+		async (outcome) => {
+			vi.useFakeTimers();
+			const auth = createAuth();
+			const processing = {
+				phase: "processing",
+				processingError: null,
+				processingMessage: "Processing",
+				processingProgress: 50,
+				total: 100,
+				uploaded: 100,
+			};
+			const firstPage = (upload: typeof processing | null) => ({
+				caps: Array.from({ length: 30 }, (_, index) => ({
+					id: `cap_${index + 1}`,
+					title: `Cap ${index + 1}`,
+					upload: index === 0 ? upload : null,
+				})),
+				folders: [],
+				hasMore: true,
+				limit: 30,
+				page: 1,
+				pagination: { hasNextPage: true, page: 1, totalPages: 2 },
+				rootFolders: [],
+				total: 31,
+			});
+			const pendingRefresh = createDeferred<ReturnType<typeof firstPage>>();
+			const listCaps = vi
+				.fn<AuthStub["client"]["listCaps"]>()
+				.mockResolvedValueOnce(firstPage(processing))
+				.mockReturnValueOnce(pendingRefresh.promise);
+			if (outcome === "success")
+				listCaps.mockResolvedValueOnce(firstPage(null));
+			if (outcome === "failure")
+				listCaps.mockRejectedValueOnce(new Error("Refresh unavailable"));
+			listCaps.mockResolvedValue({
+				...firstPage(null),
+				caps: [{ id: "cap_31", title: "Cap 31", upload: null }],
+				hasMore: false,
+				page: 2,
+			});
+			auth.client.listCaps = listCaps;
+			auth.client.getCapStatuses = vi
+				.fn()
+				.mockResolvedValueOnce({ caps: [{ id: "cap_1", upload: processing }] })
+				.mockResolvedValue({ caps: [{ id: "cap_1", upload: null }] });
+			authState.value = auth;
+			const renderer = await renderComponent(React.createElement(CapsScreen));
+			try {
+				expect(auth.client.listCaps).toHaveBeenCalledTimes(1);
+				expect(auth.client.getCapStatuses).toHaveBeenCalledTimes(1);
+				const { FlashList } = await import("@shopify/flash-list");
+				let refresh: Promise<void> | undefined;
+				await act(async () => {
+					refresh = renderer.root
+						.findByType(FlashList)
+						.props.refreshControl.props.onRefresh();
+					await Promise.resolve();
+				});
+				expect(auth.client.listCaps).toHaveBeenCalledTimes(2);
+				await act(async () => {
+					await vi.advanceTimersByTimeAsync(3000);
+				});
+				expect(auth.client.listCaps).toHaveBeenCalledTimes(3);
+				await act(async () => {
+					pendingRefresh.resolve(firstPage(processing));
+					await refresh;
+				});
+				await act(async () => {
+					renderer.root.findByType(FlashList).props.onEndReached();
+					await Promise.resolve();
+				});
+				const cards = renderer.root.findAll(
+					(node) => String(node.type) === "CapCard",
+				);
+				expect(auth.client.listCaps).toHaveBeenLastCalledWith(
+					expect.objectContaining({ page: 2, limit: 30 }),
+				);
+				expect(cards.map((card) => card.props.cap.id)).toEqual(
+					Array.from({ length: 31 }, (_, index) => `cap_${index + 1}`),
+				);
+			} finally {
+				await act(async () => renderer.unmount());
+				vi.useRealTimers();
+			}
+		},
+	);
 
 	it("loads the next dashboard page without replacing visible Caps", async () => {
 		const auth = createAuth();
